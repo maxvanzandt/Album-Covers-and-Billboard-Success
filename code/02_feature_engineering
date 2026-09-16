@@ -1,0 +1,285 @@
+"""
+Feature extraction (RGB/HSV/texture/edge features from cover images)
+and feature-group clustering (PCA + k-means) pipeline.
+"""
+import os
+import random
+import math
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from scipy.stats import skew, kurtosis
+from skimage import color, feature, filters
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score, calinski_harabasz_score, davies_bouldin_score
+from sklearn.metrics import adjusted_rand_score
+
+random.seed(42)
+np.random.seed(42)
+
+
+# --- Feature extraction ---
+
+def extract_features(img):
+    img_gray = color.rgb2gray(img)
+
+    # HSV color histograms (8 bins each)
+    hsv = color.rgb2hsv(img)
+    hist_h = np.histogram(hsv[..., 0], bins=8, range=(0, 1), density=True)[0]
+    hist_s = np.histogram(hsv[..., 1], bins=8, range=(0, 1), density=True)[0]
+    hist_v = np.histogram(hsv[..., 2], bins=8, range=(0, 1), density=True)[0]
+    color_feat = np.concatenate([hist_h, hist_s, hist_v])
+
+    # RGB channel statistics
+    r, g, b = img[..., 0], img[..., 1], img[..., 2]
+    rgb_means = [r.mean(), g.mean(), b.mean()]
+    rgb_stds = [r.std(), g.std(), b.std()]
+    rgb_skews = [skew(r.flatten()), skew(g.flatten()), skew(b.flatten())]
+    rgb_kurts = [kurtosis(r.flatten()), kurtosis(g.flatten()), kurtosis(b.flatten())]
+    rgb_stats = np.concatenate([rgb_means, rgb_stds, rgb_skews, rgb_kurts])
+
+    # Texture (Local Binary Pattern)
+    lbp = feature.local_binary_pattern(img_gray, P=8, R=1)
+    lbp_hist = np.histogram(lbp, bins=32, range=(0, 256), density=True)[0]
+
+    # Edge features (Canny + Sobel)
+    edges = feature.canny(img_gray, sigma=1.5)
+    sobel_mean = filters.sobel(img_gray).mean()
+    edge_density = edges.mean()
+
+    return np.concatenate([color_feat, rgb_stats, lbp_hist, [sobel_mean, edge_density]])
+
+
+def run_feature_extraction(sample_imgs, output_csv):
+    feature_list, names = [], []
+    total = len(sample_imgs)
+    step = max(1, math.ceil(total * 0.05))
+    pbar = tqdm(total=total, desc="Extracting features (5% steps)", ncols=100)
+    count = 0
+
+    for path in sample_imgs:
+        img = load_and_preprocess(path)
+        if img is None:
+            continue
+        feats = extract_features(img)
+        feature_list.append(feats)
+        names.append(os.path.basename(path))
+        count += 1
+        if (count % step == 0) or (count == total):
+            pbar.update(step)
+    pbar.close()
+
+    columns = (
+        [f"h_{i}" for i in range(8)] +
+        [f"s_{i}" for i in range(8)] +
+        [f"v_{i}" for i in range(8)] +
+        [f"rgb_mean_{c}" for c in ["R", "G", "B"]] +
+        [f"rgb_std_{c}" for c in ["R", "G", "B"]] +
+        [f"rgb_skew_{c}" for c in ["R", "G", "B"]] +
+        [f"rgb_kurt_{c}" for c in ["R", "G", "B"]] +
+        [f"lbp_{i}" for i in range(32)] +
+        ["sobel_mean", "edge_density"]
+    )
+
+    df_features = pd.DataFrame(feature_list, columns=columns, index=names)
+    df_features.to_csv(output_csv)
+    print(f"Saved enhanced feature CSV -> {output_csv}")
+    return df_features
+
+
+# --- PCA + k-means clustering pipeline (per feature group) ---
+
+def evaluate_pca_kmeans(X_scaled, n_components_list, k_range, random_state=42):
+    """
+    For each PCA dimension in n_components_list:
+      - fit PCA
+      - run k-means for all K in k_range
+      - compute silhouette scores
+      - keep the best K and clustering result
+    """
+    results = {}
+    for n in n_components_list:
+        pca = PCA(n_components=n, random_state=random_state)
+        X_pca = pca.fit_transform(X_scaled)
+
+        scores, models, labels_list = [], [], []
+        k_values = list(k_range)
+        for k in k_values:
+            km = KMeans(n_clusters=k, n_init=10, random_state=random_state)
+            labels = km.fit_predict(X_pca)
+            score = silhouette_score(X_pca, labels)
+            scores.append(score)
+            models.append(km)
+            labels_list.append(labels)
+
+        best_idx = int(np.argmax(scores))
+        results[n] = {
+            "pca": pca,
+            "X_pca": X_pca,
+            "k_values": k_values,
+            "scores": scores,
+            "best_k": k_values[best_idx],
+            "best_score": scores[best_idx],
+            "best_model": models[best_idx],
+            "best_labels": labels_list[best_idx],
+        }
+
+    plt.figure(figsize=(7, 5))
+    for n in n_components_list:
+        plt.plot(results[n]["k_values"], results[n]["scores"], marker="o", label=f"{n} PCs")
+    plt.xlabel("Number of clusters K")
+    plt.ylabel("Silhouette score")
+    plt.title("K-means performance under different PCA dimensions")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    for n in n_components_list:
+        print(f"PCA with {n} components -> best K = {results[n]['best_k']}, "
+              f"Silhouette = {results[n]['best_score']:.3f}")
+
+    return results
+
+
+def compute_feat_table(pca_obj, feature_names):
+    """Return loadings + normalized contributions for one PCA object."""
+    comps = pca_obj.components_
+    n_pc = comps.shape[0]
+    loadings = pd.DataFrame(comps.T, index=feature_names,
+                             columns=[f"PC{i+1}" for i in range(n_pc)])
+    contrib = loadings ** 2
+    contrib = contrib.div(contrib.sum(axis=0), axis=1)
+    contrib.columns = [f"{c}_contrib" for c in loadings.columns]
+    return pd.concat([loadings, contrib], axis=1)
+
+
+def run_clustering_pipeline(csv_path, selected_cols, n_components_list=(2, 5, 8),
+                             k_range=range(2, 11), top_k=10):
+    df = pd.read_csv(csv_path, index_col=0)
+    print("Raw feature table shape:", df.shape)
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(df[selected_cols])
+    print("Normalized feature matrix shape:", X_scaled.shape)
+
+    # Explained variance inspection
+    pca_full = PCA()
+    pca_full.fit(X_scaled)
+    explained_var_ratio = pca_full.explained_variance_ratio_
+    print("Number of PCs:", len(explained_var_ratio))
+    for i, v in enumerate(explained_var_ratio[:10], start=1):
+        print(f"PC{i}: {v:.4f}")
+
+    plt.figure(figsize=(6, 4))
+    plt.plot(range(1, len(explained_var_ratio) + 1), explained_var_ratio, marker="o")
+    plt.xlabel("Principal Component index")
+    plt.ylabel("Explained variance ratio")
+    plt.title("Scree plot of PCA components")
+    plt.tight_layout()
+    plt.show()
+
+    cum_explained = np.cumsum(explained_var_ratio)
+    plt.figure(figsize=(6, 4))
+    plt.plot(range(1, len(cum_explained) + 1), cum_explained, marker="o")
+    plt.xlabel("Principal Component index")
+    plt.ylabel("Cumulative explained variance ratio")
+    plt.title("Cumulative explained variance")
+    plt.axhline(y=0.8, linestyle="--")
+    plt.tight_layout()
+    plt.show()
+
+    pca_kmeans_results = evaluate_pca_kmeans(X_scaled, n_components_list, k_range)
+
+    # Visualize best clustering on PCA(2)
+    pca2_info = pca_kmeans_results[2]
+    X_pca2 = pca2_info["X_pca"]
+    labels2 = pca2_info["best_labels"]
+    best_k2 = pca2_info["best_k"]
+    explained2 = pca2_info["pca"].explained_variance_ratio_.sum()
+    print(f"Explained variance (2 PCs): {explained2:.4f}")
+    print(f"Best K for 2 PCs: {best_k2}")
+
+    plt.figure(figsize=(6, 5))
+    sc = plt.scatter(X_pca2[:, 0], X_pca2[:, 1], c=labels2, s=10, alpha=0.7)
+    plt.title(f"PCA 2D clusters (PC1 vs PC2), K = {best_k2}")
+    plt.xlabel("PC1")
+    plt.ylabel("PC2")
+    plt.colorbar(sc, label="Cluster")
+    plt.tight_layout()
+    plt.show()
+
+    # Feature loadings/contributions
+    feat_pc_tables = {}
+    for n in n_components_list:
+        info = pca_kmeans_results[n]
+        pca_n = info["pca"]
+        print(f"\n=== PCA with {n} components ===")
+        table = compute_feat_table(pca_n, selected_cols)
+        feat_pc_tables[n] = table
+        for i in range(pca_n.n_components_):
+            pc_name = f"PC{i+1}"
+            contrib_col = f"{pc_name}_contrib"
+            print(f"Top {top_k} features for {pc_name}:")
+            print(table.sort_values(contrib_col, ascending=False).head(top_k))
+
+    # Internal validation metrics on PCA(2)
+    K_range = range(2, 12)
+    sil_scores, ch_scores, db_scores = [], [], []
+    for k in K_range:
+        km = KMeans(n_clusters=k, random_state=42, n_init=10)
+        labels_k = km.fit_predict(X_pca2)
+        sil_scores.append(silhouette_score(X_pca2, labels_k))
+        ch_scores.append(calinski_harabasz_score(X_pca2, labels_k))
+        db_scores.append(davies_bouldin_score(X_pca2, labels_k))
+
+    for title, ylabel, scores in [
+        ("Silhouette score vs. K (PCA 2D)", "Silhouette score", sil_scores),
+        ("Calinski\u2013Harabasz index vs. K (PCA 2D)", "CH index (higher is better)", ch_scores),
+        ("Davies\u2013Bouldin index vs. K (PCA 2D)", "DB index (lower is better)", db_scores),
+    ]:
+        plt.figure(figsize=(5, 4))
+        plt.plot(list(K_range), scores, marker="o")
+        plt.title(title)
+        plt.xlabel("K")
+        plt.ylabel(ylabel)
+        plt.grid(True)
+        plt.tight_layout()
+        plt.show()
+
+    print("Silhouette:", dict(zip(K_range, np.round(sil_scores, 3))))
+    print("Calinski\u2013Harabasz:", dict(zip(K_range, np.round(ch_scores, 1))))
+    print("Davies\u2013Bouldin:", dict(zip(K_range, np.round(db_scores, 3))))
+
+    # Stability check via ARI
+    n_runs = 8
+    base_km = KMeans(n_clusters=best_k2, random_state=0, n_init=10)
+    base_labels = base_km.fit_predict(X_pca2)
+    ari_scores = []
+    for seed in range(1, n_runs + 1):
+        km = KMeans(n_clusters=best_k2, random_state=seed, n_init=10)
+        labels_seed = km.fit_predict(X_pca2)
+        ari_scores.append(adjusted_rand_score(base_labels, labels_seed))
+
+    print(f"Adjusted Rand Index vs. seed (K={best_k2}, PCA 2D):")
+    for i, ari in enumerate(ari_scores, start=1):
+        print(f"  run {i}: ARI = {ari:.3f}")
+    print(f"\nMean ARI: {np.mean(ari_scores):.3f}, std: {np.std(ari_scores):.3f}")
+
+    return feat_pc_tables
+
+
+if __name__ == "__main__":
+    COVER_DIR = "/content/drive/MyDrive/Music Capstone/Data Collection/covers"
+    CSV_PATH = "/content/drive/MyDrive/Music Capstone/Feature Engineering/Demo_315_1105.csv"
+
+    # Extraction step needs sample_imgs (list of image paths) defined
+    # df_features = run_feature_extraction(sample_imgs, OUTPUT_CSV)
+
+    # Clustering step - re-run per feature group by swapping selected_cols
+    df_cols = pd.read_csv(CSV_PATH, index_col=0, nrows=0).columns
+    hsv_cols = list(df_cols[0:24])
+    # rgb_cols = list(df_cols[25:37])  # swap in for RGB group
+    run_clustering_pipeline(CSV_PATH, selected_cols=hsv_cols)
