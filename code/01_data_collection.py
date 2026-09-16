@@ -1,6 +1,6 @@
 """
-Data collection: MusicBrainz album metadata + Billboard 200 chart data,
-plus downloading cover art images.
+Data collection: MusicBrainz album metadata + cover art, and
+Billboard 200 chart data + cover art.
 """
 import os
 import re
@@ -8,10 +8,65 @@ import time
 import datetime as dt
 import requests
 import pandas as pd
-import billboard
 from tqdm import tqdm
+import billboard
 
-# --- MusicBrainz: fetch album releases in a date range ---
+# --- Google Drive mount (Colab) ---
+
+def safe_mount_drive(mount_path='/content/drive'):
+    from google.colab import drive
+    import shutil
+    if os.path.ismount(mount_path):
+        print(f"Drive is already mounted at {mount_path}.")
+        return
+    print(f"Mounting Google Drive at {mount_path}...")
+    if os.path.exists(mount_path):
+        if os.path.isdir(mount_path) and os.listdir(mount_path):
+            print(f"Warning: mount point {mount_path} not empty. Clearing contents...")
+            for item in os.listdir(mount_path):
+                item_path = os.path.join(mount_path, item)
+                if os.path.isfile(item_path) or os.path.islink(item_path):
+                    os.remove(item_path)
+                elif os.path.isdir(item_path):
+                    shutil.rmtree(item_path)
+        elif not os.path.isdir(mount_path):
+            os.remove(mount_path)
+    os.makedirs(mount_path, exist_ok=True)
+    drive.mount(mount_path, force_remount=True)
+    print("Drive mounted successfully.")
+
+
+# --- Config ---
+
+SAVE_DIR = "/content/drive/MyDrive/Music Capstone/Data Collection"
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+MB_START_DATE = "2024-12-01"
+MB_END_DATE = "2025-07-01"
+MB_PRIMARY_TYPE = "Album"
+MB_SAMPLE_SIZE = 2000
+
+BB_CHART_NAME = "billboard-200"
+BB_START_DATE = "2025-01-01"
+BB_END_DATE = "2025-07-01"
+
+# MusicBrainz API metadata requests need a MusicBrainz-registered User-Agent
+MB_BASE_URL_REL = "https://musicbrainz.org/ws/2/release"
+CAA_BASE_URL_REL = "https://coverartarchive.org/release"
+MB_HEADERS = {"User-Agent": "haoting-music-scraper/0.1 (pqg2rb@virginia.edu)"}
+
+# Cover Art Archive image downloads need a browser-like User-Agent, separate
+# from the MusicBrainz API header above
+CAA_DOWNLOAD_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/120.0.0.0 Safari/537.36"
+}
+
+
+# =========================================================================
+# MusicBrainz: fetch album releases in a date range
+# =========================================================================
 
 def fetch_unique_album_releases_by_date_range(start_date, end_date,
                                                 primary_type="Album",
@@ -23,8 +78,8 @@ def fetch_unique_album_releases_by_date_range(start_date, end_date,
     and whose primary type is `primary_type`, by iterating over
     paginated MusicBrainz results.
 
-    We then DEDUPLICATE by `release-group.id`, so that each album
-    (release-group) appears at most once.
+    DEDUPLICATES by `release-group.id`, so each album (release-group)
+    appears at most once.
 
     Returns: a list of release dicts, one per unique album.
     """
@@ -43,7 +98,7 @@ def fetch_unique_album_releases_by_date_range(start_date, end_date,
         }
 
         print(f"Requesting page {page} (offset={offset}) ...")
-        resp = requests.get(MB_BASE_URL_REL, params=params, headers=HEADERS)
+        resp = requests.get(MB_BASE_URL_REL, params=params, headers=MB_HEADERS)
         resp.raise_for_status()
         data = resp.json()
 
@@ -57,9 +112,7 @@ def fetch_unique_album_releases_by_date_range(start_date, end_date,
         for rel in releases:
             rg = rel.get("release-group") or {}
             rgid = rg.get("id")
-            if not rgid:
-                continue
-            if rgid in seen_release_group_ids:
+            if not rgid or rgid in seen_release_group_ids:
                 continue
             seen_release_group_ids.add(rgid)
             all_releases.append(rel)
@@ -81,9 +134,9 @@ def fetch_unique_album_releases_by_date_range(start_date, end_date,
 
 def releases_to_dataframe(releases):
     """
-    Convert a list of release dicts into a tidy pandas DataFrame.
-    We flatten all relevant MusicBrainz fields and also add a
-    Cover Art Archive front-cover URL for each release.
+    Convert a list of MusicBrainz release dicts into a tidy pandas
+    DataFrame, flattening artist credits, labels, media, release
+    events, tags, and text representation.
     """
     rows = []
     for rel in releases:
@@ -140,8 +193,6 @@ def releases_to_dataframe(releases):
         tag_names = [t["name"] for t in tags_list if isinstance(t, dict) and "name" in t]
 
         text_rep = rel.get("text-representation", {}) or {}
-        lang = text_rep.get("language")
-        script = text_rep.get("script")
 
         rows.append({
             "release_id": rel.get("id"),
@@ -172,14 +223,97 @@ def releases_to_dataframe(releases):
             "release_event_dates": "; ".join(event_dates),
             "release_event_areas": "; ".join(event_areas),
             "tags": "; ".join(tag_names),
-            "language": lang,
-            "script": script,
+            "language": text_rep.get("language"),
+            "script": text_rep.get("script"),
         })
 
     return pd.DataFrame(rows)
 
 
-# --- Billboard 200: fetch weekly chart data ---
+def sample_musicbrainz_albums(df, n=MB_SAMPLE_SIZE, random_state=42):
+    """Uniformly sample n albums (without replacement) as the negative/'normal' class."""
+    return df.sample(n=n, random_state=random_state)
+
+
+def add_cover_art_urls(df):
+    """Attach the Cover Art Archive metadata URL for each release."""
+    df = df.copy()
+    df["cover_art_front_url"] = CAA_BASE_URL_REL + "/" + df["release_id"].astype(str)
+    return df
+
+
+def download_musicbrainz_covers(df, output_folder,
+                                 image_column="cover_art_front_url",
+                                 title_column="title", pause_sec=1.0):
+    """
+    Two-step MusicBrainz cover download:
+      1. GET the Cover Art Archive metadata JSON for the release
+      2. Find the image entry marked "front": true, then download that image
+
+    This is a different mechanism from Billboard cover downloads (which
+    fetch a direct image URL in one step) - MusicBrainz releases don't
+    provide a direct front-cover image link, only a metadata endpoint.
+    """
+    os.makedirs(output_folder, exist_ok=True)
+
+    def clean_filename(name):
+        name = re.sub(r'[\\/*?:"<>|]', "_", str(name))
+        return name.strip()[:150]
+
+    for i, row in tqdm(df.iterrows(), total=len(df), desc="Downloading MusicBrainz covers"):
+        time.sleep(pause_sec)
+        url = row.get(image_column)
+        title = row.get(title_column)
+
+        if not isinstance(url, str) or not url.strip():
+            continue
+
+        filename = clean_filename(title) if pd.notna(title) else f"image_{i}"
+        file_path = os.path.join(output_folder, f"{filename}.jpg")
+
+        if os.path.exists(file_path):
+            continue
+
+        try:
+            response = requests.get(url, headers=CAA_DOWNLOAD_HEADERS, timeout=10)
+            if response.status_code != 200:
+                time.sleep(1)
+                response = requests.get(url, headers=CAA_DOWNLOAD_HEADERS, timeout=10)
+            if response.status_code != 200:
+                print(f"Skipped metadata for {title} (status {response.status_code})")
+                continue
+
+            data = response.json()
+            front_image_url = next(
+                (img.get("image") for img in data.get("images", []) if img.get("front") is True),
+                None
+            )
+            if not front_image_url:
+                print(f"No front cover found for {title}")
+                continue
+
+            img_response = requests.get(front_image_url, headers=CAA_DOWNLOAD_HEADERS,
+                                         allow_redirects=True, timeout=15)
+            if img_response.status_code != 200:
+                time.sleep(1)
+                img_response = requests.get(front_image_url, headers=CAA_DOWNLOAD_HEADERS,
+                                             allow_redirects=True, timeout=15)
+
+            if img_response.status_code == 200:
+                with open(file_path, "wb") as f:
+                    f.write(img_response.content)
+            else:
+                print(f"Failed downloading {front_image_url} (status {img_response.status_code})")
+
+        except Exception as e:
+            print(f"Error processing {title}: {e}")
+
+    print("MusicBrainz cover downloads complete ->", output_folder)
+
+
+# =========================================================================
+# Billboard 200: fetch weekly chart data + cover downloads
+# =========================================================================
 
 def _to_date(s: str) -> dt.date:
     return dt.datetime.strptime(s, "%Y-%m-%d").date()
@@ -213,13 +347,20 @@ def _download_image(url: str, save_path: str, timeout=15) -> bool:
 
 
 def fetch_weeks_in_range(chart_name: str, start_date: str, end_date: str) -> pd.DataFrame:
+    """
+    Fetch every weekly Billboard chart within [start_date, end_date].
+    Steps back one week (7 days) at a time from end_date until the
+    window is fully covered.
+    """
     start_d = _to_date(start_date)
     end_d = _to_date(end_date)
-    assert start_d <= end_d, "START_DATE <= END_DATE"
+    assert start_d <= end_d, "START_DATE must be <= END_DATE"
 
     chart = billboard.ChartData(chart_name, date=end_date)
-    while chart.date and _to_date(chart.date) > end_d and chart.previousDate:
-        chart = billboard.ChartData(chart_name, date=chart.previousDate)
+    prev_date = (dt.datetime.fromisoformat(chart.date).date() - dt.timedelta(days=7)).isoformat()
+    while chart.date and _to_date(chart.date) > end_d and prev_date:
+        chart = billboard.ChartData(chart_name, date=prev_date)
+        prev_date = (dt.datetime.fromisoformat(chart.date).date() - dt.timedelta(days=7)).isoformat()
 
     charts = []
     seen_dates = set()
@@ -227,8 +368,9 @@ def fetch_weeks_in_range(chart_name: str, start_date: str, end_date: str) -> pd.
         charts.append(chart)
         seen_dates.add(chart.date)
 
-    while chart and chart.previousDate:
-        prev = billboard.ChartData(chart_name, date=chart.previousDate)
+    while chart:
+        prev_date = (dt.datetime.fromisoformat(chart.date).date() - dt.timedelta(days=7)).isoformat()
+        prev = billboard.ChartData(chart_name, date=prev_date)
         if not prev.date:
             break
         if prev.date not in seen_dates:
@@ -277,37 +419,87 @@ def fetch_weeks_in_range(chart_name: str, start_date: str, end_date: str) -> pd.
     return df
 
 
+def download_billboard_covers(df: pd.DataFrame, cover_dir: str) -> pd.DataFrame:
+    """
+    Single-step Billboard cover download: billboard.py already provides
+    a direct image URL per chart entry (row["coverurl"]).
+    """
+    if df.empty:
+        df["cover_path"] = None
+        return df
+
+    os.makedirs(cover_dir, exist_ok=True)
+    paths = []
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="Downloading Billboard covers"):
+        url = row.get("coverurl")
+        if not url or not isinstance(url, str):
+            paths.append(None)
+            continue
+
+        ext = _pick_ext_from_url(url)
+        basename = (f"{row.get('chart_date', 'NA')}_{str(row.get('rank', 'NA')).zfill(3)}_"
+                    f"{_sanitize_filename(row.get('artist', 'NA'))} - "
+                    f"{_sanitize_filename(row.get('title', 'NA'))}{ext}")
+        save_path = os.path.join(cover_dir, basename)
+
+        if os.path.exists(save_path):
+            paths.append(save_path)
+            continue
+
+        ok = _download_image(url, save_path)
+        paths.append(save_path if ok else None)
+
+    df = df.copy()
+    df["cover_path"] = paths
+    return df
+
+
+# =========================================================================
+# Main
+# =========================================================================
+
 if __name__ == "__main__":
-    # --- Run MusicBrainz collection ---
+    safe_mount_drive()
+
+    # --- MusicBrainz: fetch full album universe in the date window ---
     releases = fetch_unique_album_releases_by_date_range(
-        START_DATE, END_DATE, PRIMARY_TYPE,
+        MB_START_DATE, MB_END_DATE, MB_PRIMARY_TYPE,
         page_size=100, pause_sec=1.0
     )
     releases_df = releases_to_dataframe(releases)
 
     n_rows = len(releases_df)
     n_unique_rg = releases_df["release_group_id"].nunique()
-    print(f"DataFrame rows: {n_rows}")
-    print(f"Unique release_group_id: {n_unique_rg}")
+    print(f"DataFrame rows: {n_rows}, unique release_group_id: {n_unique_rg}")
     if n_rows != n_unique_rg:
         print("WARNING: rows and unique release_group_id do not match.")
-    else:
-        print("OK: one row per album (release-group).")
 
-    csv_name = f"musicbrainz_albums_{START_DATE}_to_{END_DATE}.csv"
-    csv_path = os.path.join(SAVE_DIR, csv_name)
-    releases_df.to_csv(csv_path, index=False)
-    print(f"Saved album metadata to: {csv_path}")
+    mb_csv_name = f"musicbrainz_albums_{MB_START_DATE}_to_{MB_END_DATE}.csv"
+    mb_csv_path = os.path.join(SAVE_DIR, mb_csv_name)
+    releases_df.to_csv(mb_csv_path, index=False)
+    print(f"Saved album metadata to: {mb_csv_path}")
 
-    # --- Run Billboard collection ---
-    df = fetch_weeks_in_range(CHART_NAME, START_DATE, END_DATE)
-    if df.empty:
-        print("df empty")
+    # --- MusicBrainz: sample 2000 albums as the 'normal' (non-charting) class ---
+    sampled_df = sample_musicbrainz_albums(releases_df, n=MB_SAMPLE_SIZE)
+    sampled_df = add_cover_art_urls(sampled_df)
+    mb_sample_path = os.path.join(SAVE_DIR, "musicbrainz_albums_sample_2000.csv")
+    sampled_df.to_csv(mb_sample_path, index=False)
+    print(f"Saved MusicBrainz sample to: {mb_sample_path}")
+
+    mb_cover_dir = os.path.join(SAVE_DIR, "Music Brainz 2000 Covers")
+    download_musicbrainz_covers(sampled_df, mb_cover_dir)
+
+    # --- Billboard: fetch weekly chart data ---
+    bb_df = fetch_weeks_in_range(BB_CHART_NAME, BB_START_DATE, BB_END_DATE)
+    if bb_df.empty:
+        print("Billboard chart fetch returned no rows.")
     else:
-        uniq_weeks = sorted(df["chart_date"].unique())
-        print(uniq_weeks)
-        df = download_covers(df, COVER_DIR)
-        df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
-        print(f"\nalbum info saved: \n{OUTPUT_CSV}")
-        print(f"covers saved: \n{COVER_DIR}")
-        print(df.head(10))
+        bb_cover_dir = os.path.join(SAVE_DIR, f"covers {BB_START_DATE} {BB_END_DATE}")
+        bb_df = download_billboard_covers(bb_df, bb_cover_dir)
+
+        bb_csv_path = os.path.join(
+            SAVE_DIR, f"billboard_{BB_CHART_NAME}_{BB_START_DATE}_to_{BB_END_DATE}.csv"
+        )
+        bb_df.to_csv(bb_csv_path, index=False, encoding="utf-8-sig")
+        print(f"Saved Billboard chart data to: {bb_csv_path}")
+        print(f"Covers saved to: {bb_cover_dir}")
